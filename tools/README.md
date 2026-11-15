@@ -63,3 +63,10 @@ python tools/convert_arcface.py --onnx-path /path/to/w600k_mbf.onnx
 If you ever swap in a different ArcFace variant (e.g. `w600k_r50` via
 `--variant w600k_r50`), this contract stays the same — only the file size
 and latency change.
+
+# Pipeline benchmark
+
+`tools/run_pipeline_benchmark.sh` builds `pipeline_benchmark.swift` against the real app files and measures, on the
+live camera: camera startup and delivered fps (old vs. new format rule), each per-frame stage (detect, align, ArcFace,
+native crop, bezel, glare), and how many frames per second the 1.x and 2.0 scan loops actually analyse. Pass an image
+path to time the stages on a still photo instead. Needs Xcode (for `coremlcompiler`) and camera access for the terminal.

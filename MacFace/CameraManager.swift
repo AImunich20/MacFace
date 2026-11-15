@@ -4,6 +4,15 @@
 //
 //  Owns the AVCaptureSession and publishes the newest camera frame as a CGImage. Runs entirely on-device.
 //
+//  2.0 changes:
+//  - All session configuration (input swap, format selection, start/stop) runs on the capture queue, never the main
+//    thread, so starting the camera can't stall the notch animation.
+//  - Frames go to `frames` (a `LatestFrameBox`) straight from the capture queue. `currentFrame` — the observable,
+//    main-actor copy used by onboarding and Face Lab — is only published when `publishesObservableFrames` is true.
+//  - Recovers by itself after a capture-session runtime error or a camera disconnect (sleep, dock, monitor switch),
+//    and `restart()` lets callers rebuild a session that went silent.
+//  - `stop(after:)` keeps the camera warm briefly so a retry right after a scan doesn't pay the startup cost again.
+//
 
 @preconcurrency import AVFoundation
 import CoreImage
@@ -15,14 +24,6 @@ enum CameraPermission {
     case denied
 }
 
-/// `source` is a `CIImage` — a lazy recipe, not rendered pixels — so holding onto it costs nothing until `renderCrop` uses it.
-struct CameraFrame {
-    let id: UInt64
-    let image: CGImage
-    let source: CIImage
-    let sourceSize: CGSize
-}
-
 @Observable
 @MainActor
 final class CameraManager: NSObject {
@@ -31,20 +32,34 @@ final class CameraManager: NSObject {
     private(set) var currentFrame: CameraFrame?
     private(set) var errorMessage: String?
 
+    /// Newest frame, readable from any task without touching the main actor.
+    nonisolated var frames: LatestFrameBox { capture.frames }
+
     /// Exposed read-only so `CameraPreviewView` can attach a preview layer to the same session.
-    let session = AVCaptureSession()
-    private let videoOutput = AVCaptureVideoDataOutput()
-    private let sessionQueue = DispatchQueue(label: "com.aimunich20.macface.camera.session")
+    nonisolated var session: AVCaptureSession { capture.session }
 
-    /// Handed to the delegate outside the actor; only ever touched via `Task { @MainActor ... }`.
-    private let framePublisher = FramePublisher()
+    @ObservationIgnored private nonisolated let capture: CaptureController
+    @ObservationIgnored private var pendingStop: Task<Void, Never>?
 
-    override init() {
+    /// `publishesObservableFrames: false` skips the per-frame main-actor hop for owners that read `frames` instead.
+    init(publishesObservableFrames: Bool = true) {
+        capture = CaptureController(publishesObservableFrames: publishesObservableFrames)
         super.init()
-        framePublisher.owner = self
+        capture.onFrame = { [weak self] frame in
+            Task { @MainActor [weak self] in self?.currentFrame = frame }
+        }
+        capture.onError = { [weak self] message in
+            Task { @MainActor [weak self] in self?.errorMessage = message }
+        }
+        capture.onDeviceLost = { [weak self] in
+            Task { @MainActor [weak self] in self?.handleDeviceLost() }
+        }
     }
 
     func start() async {
+        pendingStop?.cancel()
+        pendingStop = nil
+
         let status = AVCaptureDevice.authorizationStatus(for: .video)
         switch status {
         case .authorized:
@@ -64,26 +79,58 @@ final class CameraManager: NSObject {
             return
         }
 
-        errorMessage = nil
-        configureSessionIfNeeded()
-        reconcileDeviceIfNeeded()
-
-        sessionQueue.async { [session] in
-            if !session.isRunning {
-                session.startRunning()
-            }
+        // Resolved here because the camera preference lives in main-actor settings; everything after is off-main.
+        guard let device = CameraDeviceCatalog.resolvedDevice() else {
+            errorMessage = "No camera device found."
+            return
         }
+        errorMessage = nil
+        capture.start(with: device)
         isRunning = true
     }
 
-    func stop() {
-        sessionQueue.async { [session] in
-            if session.isRunning {
-                session.stopRunning()
-            }
+    /// Starts the camera ahead of a likely scan (e.g. the lock screen just woke) without prompting for permission,
+    /// and lets it stop by itself after `duration` unless a scan's `start()` claims it first.
+    func prewarm(for duration: Duration) {
+        guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized, !isRunning else { return }
+        Task { [weak self] in
+            await self?.start()
+            self?.stop(after: duration)
         }
+    }
+
+    func stop() {
+        pendingStop?.cancel()
+        pendingStop = nil
+        capture.stop()
         isRunning = false
         currentFrame = nil
+    }
+
+    /// Keeps the session running for `delay`, so an immediate retry starts with a hot camera. A `start()` in the
+    /// meantime cancels the stop.
+    func stop(after delay: Duration) {
+        pendingStop?.cancel()
+        pendingStop = Task { [weak self] in
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled else { return }
+            self?.stop()
+        }
+    }
+
+    /// Tears the input down and rebuilds it — for a session that is "running" but has stopped delivering frames.
+    func restart() {
+        guard isRunning, let device = CameraDeviceCatalog.resolvedDevice() else { return }
+        capture.restart(with: device)
+    }
+
+    private func handleDeviceLost() {
+        guard isRunning else { return }
+        if let device = CameraDeviceCatalog.resolvedDevice() {
+            capture.restart(with: device)
+        } else {
+            errorMessage = "No camera device found."
+        }
     }
 
     private func describe(_ status: AVAuthorizationStatus) -> String {
@@ -96,35 +143,104 @@ final class CameraManager: NSObject {
         }
     }
 
+    /// Kept here for existing callers; the implementation lives in `CameraFrame.swift` so it has no main-actor dependencies.
+    nonisolated static func renderCrop(from frame: CameraFrame, imageRect: CGRect, maxEdge: CGFloat = 448) -> CGImage? {
+        FrameCropper.renderCrop(from: frame, imageRect: imageRect, maxEdge: maxEdge)
+    }
+}
+
+/// Everything that touches the capture session. All mutable state is confined to `queue`.
+private nonisolated final class CaptureController: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @unchecked Sendable {
+    let session = AVCaptureSession()
+    let frames = LatestFrameBox()
+
+    var onFrame: (@Sendable (CameraFrame) -> Void)?
+    var onError: (@Sendable (String) -> Void)?
+    var onDeviceLost: (@Sendable () -> Void)?
+
+    private let queue = DispatchQueue(label: "com.aimunich20.macface.camera.session")
+    private let videoOutput = AVCaptureVideoDataOutput()
+    private let publishesObservableFrames: Bool
+
+    // Confined to `queue`.
     private var isConfigured = false
     private var currentInput: AVCaptureDeviceInput?
+    private var wantsRunning = false
+    private var observers: [NSObjectProtocol] = []
 
-    private func configureSessionIfNeeded() {
+    // Confined to `queue` (the sample-buffer callback runs there too).
+    private let ciContext = CIContext()
+    /// Detection only needs a modest resolution; the live preview renders from the capture session directly and
+    /// is unaffected. The undownscaled `source` is kept alongside for callers needing native pixels (`renderCrop`).
+    private let maxLongEdge: CGFloat = 640
+    private var nextFrameID: UInt64 = 0
+
+    init(publishesObservableFrames: Bool) {
+        self.publishesObservableFrames = publishesObservableFrames
+        super.init()
+        let center = NotificationCenter.default
+        observers.append(center.addObserver(forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: nil) { [weak self] _ in
+            self?.queue.async { self?.recoverFromRuntimeError() }
+        })
+        observers.append(center.addObserver(forName: AVCaptureDevice.wasDisconnectedNotification, object: nil, queue: nil) { [weak self] note in
+            guard let device = note.object as? AVCaptureDevice else { return }
+            let uniqueID = device.uniqueID
+            self?.queue.async { self?.handleDisconnect(of: uniqueID) }
+        })
+    }
+
+    deinit {
+        observers.forEach(NotificationCenter.default.removeObserver)
+    }
+
+    func start(with device: AVCaptureDevice) {
+        queue.async { [self] in
+            wantsRunning = true
+            configureIfNeeded()
+            reconcile(with: device, force: false)
+            if !session.isRunning { session.startRunning() }
+        }
+    }
+
+    func stop() {
+        queue.async { [self] in
+            wantsRunning = false
+            if session.isRunning { session.stopRunning() }
+            frames.reset()
+        }
+    }
+
+    func restart(with device: AVCaptureDevice) {
+        queue.async { [self] in
+            guard wantsRunning else { return }
+            if session.isRunning { session.stopRunning() }
+            reconcile(with: device, force: true)
+            session.startRunning()
+        }
+    }
+
+    private func configureIfNeeded() {
         guard !isConfigured else { return }
         isConfigured = true
 
         session.beginConfiguration()
         // `.high` doesn't guarantee the sensor's max resolution; macOS (unlike iOS) doesn't fight an explicitly-set
-        // `activeFormat`, so leaving this at `.high` and locking the format separately below is sufficient.
+        // `activeFormat`, so leaving this at `.high` and locking the format separately is sufficient.
         session.sessionPreset = .high
-
         videoOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
         videoOutput.alwaysDiscardsLateVideoFrames = true
-        videoOutput.setSampleBufferDelegate(framePublisher, queue: sessionQueue)
+        videoOutput.setSampleBufferDelegate(self, queue: queue)
         if session.canAddOutput(videoOutput) {
             session.addOutput(videoOutput)
         }
-
         session.commitConfiguration()
     }
 
-    /// Called on every `start()` so a camera preference change in Settings takes effect without an app restart.
-    private func reconcileDeviceIfNeeded() {
-        guard let device = CameraDeviceCatalog.resolvedDevice() else {
-            errorMessage = "No camera device found."
+    /// Swaps the input when the preferred camera changed, the old one went away (sleep, unplug), or `force` is set.
+    private func reconcile(with device: AVCaptureDevice, force: Bool) {
+        if !force, let currentInput, currentInput.device.uniqueID == device.uniqueID, currentInput.device.isConnected {
             return
         }
-        guard device.uniqueID != currentInput?.device.uniqueID else { return }
 
         session.beginConfiguration()
         if let currentInput {
@@ -133,110 +249,53 @@ final class CameraManager: NSObject {
         if let input = try? AVCaptureDeviceInput(device: device), session.canAddInput(input) {
             session.addInput(input)
             currentInput = input
-            selectHighestResolutionFormat(for: device)
+            if let choice = CameraFormatSelector.bestFormat(for: device) {
+                do {
+                    try CameraFormatSelector.apply(choice, to: device)
+                } catch {
+                    onError?("Couldn't select the camera format: \(error.localizedDescription)")
+                }
+            }
         } else {
             currentInput = nil
-            errorMessage = "No camera device found."
+            onError?("No camera device found.")
         }
         session.commitConfiguration()
     }
 
-    /// Highest resolution regardless of fps — Vision still works from the downscaled frame; this only affects
-    /// what `CameraFrame.source` (and therefore `renderCrop`) has to work with.
-    private func selectHighestResolutionFormat(for device: AVCaptureDevice) {
-        let best = device.formats.max { lhs, rhs in
-            let l = CMVideoFormatDescriptionGetDimensions(lhs.formatDescription)
-            let r = CMVideoFormatDescriptionGetDimensions(rhs.formatDescription)
-            return Int(l.width) * Int(l.height) < Int(r.width) * Int(r.height)
-        }
-        guard let best else { return }
-        do {
-            try device.lockForConfiguration()
-            device.activeFormat = best
-            device.unlockForConfiguration()
-        } catch {
-            errorMessage = "Couldn't select the camera's highest-resolution format: \(error.localizedDescription)"
-        }
+    private func recoverFromRuntimeError() {
+        guard wantsRunning, let device = currentInput?.device else { return }
+        if session.isRunning { session.stopRunning() }
+        reconcile(with: device, force: true)
+        session.startRunning()
     }
 
-    fileprivate func publish(frame: CameraFrame) {
-        currentFrame = frame
+    private func handleDisconnect(of uniqueID: String) {
+        guard currentInput?.device.uniqueID == uniqueID else { return }
+        session.beginConfiguration()
+        if let currentInput { session.removeInput(currentInput) }
+        session.commitConfiguration()
+        currentInput = nil
+        if wantsRunning { onDeviceLost?() }
     }
 
-    /// Renders a native-resolution crop of `imageRect` from `frame.source`, for spoof-cue extraction which
-    /// needs pixel detail (screen texture, moiré, gloss) the downscaled working frame throws away.
-    nonisolated static func renderCrop(from frame: CameraFrame, imageRect: CGRect, maxEdge: CGFloat = 448) -> CGImage? {
-        let workingWidth = CGFloat(frame.image.width)
-        let workingHeight = CGFloat(frame.image.height)
-        guard workingWidth > 0, workingHeight > 0 else { return nil }
-        let scaleX = frame.sourceSize.width / workingWidth
-        let scaleY = frame.sourceSize.height / workingHeight
-
-        // Expand ~1.3x so device edges/bezels are captured for texture/moiré cues.
-        let expanded = imageRect.insetBy(dx: -imageRect.width * 0.15, dy: -imageRect.height * 0.15)
-
-        // Flip from `imageRect`'s top-left/y-down space to Core Image's bottom-left/y-up (reverse of FaceDetector.convertToImageSpace).
-        let nativeX = expanded.origin.x * scaleX
-        let nativeWidth = expanded.width * scaleX
-        let nativeHeight = expanded.height * scaleY
-        let nativeY = frame.sourceSize.height - (expanded.origin.y + expanded.height) * scaleY
-        var nativeRect = CGRect(x: nativeX, y: nativeY, width: nativeWidth, height: nativeHeight)
-
-        let sourceExtent = CGRect(origin: .zero, size: frame.sourceSize)
-        nativeRect = nativeRect.intersection(sourceExtent)
-        guard !nativeRect.isEmpty else { return nil }
-
-        var cropped = frame.source.cropped(to: nativeRect)
-            .transformed(by: CGAffineTransform(translationX: -nativeRect.minX, y: -nativeRect.minY))
-        let longEdge = max(nativeRect.width, nativeRect.height)
-        if longEdge > maxEdge {
-            let scale = maxEdge / longEdge
-            cropped = cropped.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        let sourceImage = CIImage(cvPixelBuffer: pixelBuffer)
+        let sourceExtent = sourceImage.extent
+        var ciImage = sourceImage
+        let longEdge = max(ciImage.extent.width, ciImage.extent.height)
+        if longEdge > maxLongEdge {
+            let scale = maxLongEdge / longEdge
+            ciImage = ciImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
         }
+        guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else { return }
 
-        return cropRenderContext.createCGImage(cropped, from: cropped.extent)
-    }
-
-    /// `CIContext` is expensive to create and safe to reuse concurrently. Explicitly `nonisolated` since a `static let`
-    /// on this `@MainActor` class would otherwise be main-actor-isolated, which the `nonisolated renderCrop` can't touch.
-    private nonisolated static let cropRenderContext = CIContext()
-
-    /// Sample-buffer callbacks arrive on `sessionQueue`, off the main actor; this delegate converts there, then hops back.
-    private final class FramePublisher: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
-        weak var owner: CameraManager?
-        private let ciContext = CIContext()
-        /// Detection only needs a modest resolution; the live preview renders from the capture session directly and
-        /// is unaffected. The undownscaled `source` is kept alongside for callers needing native pixels (`renderCrop`).
-        private let maxLongEdge: CGFloat = 640
-        private var nextFrameID: UInt64 = 0
-
-        func captureOutput(
-            _ output: AVCaptureOutput,
-            didOutput sampleBuffer: CMSampleBuffer,
-            from connection: AVCaptureConnection
-        ) {
-            guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-            let sourceImage = CIImage(cvPixelBuffer: pixelBuffer)
-            let sourceExtent = sourceImage.extent
-            var ciImage = sourceImage
-            let longEdge = max(ciImage.extent.width, ciImage.extent.height)
-            if longEdge > maxLongEdge {
-                let scale = maxLongEdge / longEdge
-                ciImage = ciImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-            }
-            guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else { return }
-
-            nextFrameID &+= 1
-            let frame = CameraFrame(
-                id: nextFrameID,
-                image: cgImage,
-                source: sourceImage,
-                sourceSize: sourceExtent.size
-            )
-
-            Task { @MainActor [weak owner] in
-                owner?.publish(frame: frame)
-            }
+        nextFrameID &+= 1
+        let frame = CameraFrame(id: nextFrameID, image: cgImage, source: sourceImage, sourceSize: sourceExtent.size)
+        frames.publish(frame)
+        if publishesObservableFrames {
+            onFrame?(frame)
         }
     }
 }

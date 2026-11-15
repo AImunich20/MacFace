@@ -16,7 +16,8 @@ import Observation
 final class FaceUnlockCoordinator {
     private let pocController: POCController
     let lockMonitor = LockMonitor()
-    let camera = CameraManager()
+    /// Reads frames through `camera.frames` off the main actor, so it skips publishing observable frames.
+    let camera = CameraManager(publishesObservableFrames: false)
     let pipeline = FaceRecognitionPipeline()
 
     /// Persisted via MacFaceSettings. Setting to false cancels any in-flight scan and disarms the overlay immediately.
@@ -37,8 +38,20 @@ final class FaceUnlockCoordinator {
     }
     /// A wake often catches the owner while they are still looking away from
     /// the camera. Require a sustained non-match rather than a few early
-    /// frames before giving the failure animation.
-    private let wrongFaceGraceDuration: Duration = .seconds(2)
+    /// frames before giving the failure animation. Scales with the user's
+    /// detection window (60%, never under 2s) so a longer window set in
+    /// Settings isn't cut short by an early wrong-face verdict (glance #48).
+    private var wrongFaceGraceDuration: Duration {
+        .milliseconds(Int(max(2.0, scanWindowDuration * 0.6) * 1000))
+    }
+    /// How long the camera stays on after a scan that didn't unlock, so a hover/space/auto retry starts instantly.
+    private let cameraLingerAfterScan: Duration = .seconds(4)
+    /// How long a wake keeps the camera warm while waiting for a hover or space press.
+    private let cameraPrewarmDuration: Duration = .seconds(8)
+    /// No new frame for this long mid-scan means the session went silent (seen after long sleeps / display changes, glance #49).
+    private let cameraStallTimeout: Duration = .milliseconds(1500)
+    /// Re-checks while CGSession hasn't caught up with a lock notification yet (glance #54).
+    private var lockSettleTask: Task<Void, Never>?
 
     private(set) var statusMessage = "Idle"
     private(set) var lastOutcome: String?
@@ -95,8 +108,15 @@ final class FaceUnlockCoordinator {
             hasArmedForCurrentLock = false
             hasAutoRetriedForCurrentLock = false
             disarmOverlay()
+            // CGSession can report "unlocked" for a while after `screenIsLocked` fires. Without a re-check, a plain lock
+            // (no sleep/wake after it) never starts the space monitor, so "On space" silently does nothing (glance #54).
+            if lockMonitor.isScreenLocked {
+                scheduleLockSettleCheck()
+            }
             return
         }
+        lockSettleTask?.cancel()
+        lockSettleTask = nil
         guard !lockMonitor.isSleeping else { return }
 
         // `.wake` (sleep, display sleep, or screensaver stopping) is an explicit "let me back in," so clear the one-shot guard.
@@ -125,6 +145,12 @@ final class FaceUnlockCoordinator {
         // A deselected trigger means "don't auto-scan for this signal," not "do nothing" — the user can still opt in by hand.
         let shouldAutoScan = MacFaceSettings.shared.unlockTriggers.contains(signal)
 
+        // Not scanning yet, but a hover or space press is likely soon: get the camera's ~0.4–0.7s startup out of the way now.
+        if !shouldAutoScan, MacFaceSettings.shared.prewarmCameraOnWake,
+           MacFaceSettings.shared.unlockTriggers.contains(.onSpace) || (showsUI && MacFaceSettings.shared.retryOnHover) {
+            camera.prewarm(for: cameraPrewarmDuration)
+        }
+
         // Headless has nothing to arm/hover, so if this signal isn't selected there's nothing to do — and hasArmedForCurrentLock
         // must stay false, or a later selected signal could never fire (nothing else calls arm() to reset it).
         guard showsUI || shouldAutoScan else { return }
@@ -135,6 +161,24 @@ final class FaceUnlockCoordinator {
             // arm() only shows a small closed notch silhouette, so this only needs a brief buffer past the login window's entrance.
             try? await Task.sleep(nanoseconds: 250_000_000)
             await self?.arm(autoScan: shouldAutoScan)
+        }
+    }
+
+    /// Polls CGSession for up to ~3s after a lock notification it hasn't caught up with yet, then re-runs the trigger logic.
+    private func scheduleLockSettleCheck() {
+        guard lockSettleTask == nil else { return }
+        lockSettleTask = Task { [weak self] in
+            for _ in 0..<12 {
+                try? await Task.sleep(for: .milliseconds(250))
+                guard !Task.isCancelled, let self else { return }
+                guard self.lockMonitor.isScreenLocked else { break }
+                if LockMonitor.isScreenActuallyLocked() {
+                    self.lockSettleTask = nil
+                    self.evaluateTrigger()
+                    return
+                }
+            }
+            self?.lockSettleTask = nil
         }
     }
 
@@ -261,7 +305,12 @@ final class FaceUnlockCoordinator {
         // A newer cycle now owns the camera and overlay — leave both alone, and leave the auto-retry one-shot unspent.
         guard generation == scanGeneration else { return }
 
-        camera.stop()
+        if case .matched = outcome {
+            camera.stop()
+        } else {
+            // Still locked: keep the camera warm for a retry. A new cycle's `start()` cancels this; unlocking stops it.
+            camera.stop(after: cameraLingerAfterScan)
+        }
 
         switch outcome {
         case .matched:
@@ -342,19 +391,29 @@ final class FaceUnlockCoordinator {
         var livenessConfirmed = !livenessEnabled
         /// Last frame's selected face, passed back so `selectDominantFace` stays on the same person instead of flip-flopping.
         var lastFaceBoundingBox: CGRect?
-        /// Cheap way to detect "no new camera frame yet" vs. "fresh frame" — without it a repeat frame would corrupt the liveness motion signal.
+        /// Last frame handed to the pipeline; `frames.next(after:)` only returns a newer one, so a repeat frame can't corrupt the liveness motion signal.
         var lastProcessedFrameID: UInt64?
+        /// Watchdog for a session that is "running" but silent; restarted at most once per scan.
+        var lastFrameAt = ContinuousClock.now
+        var hasRestartedCamera = false
+        let frames = camera.frames
 
         while Date() < deadline, !Task.isCancelled,
               !requireOverlayScanning || NotchOverlayController.shared.phase == .scanning {
             guard LockMonitor.isScreenActuallyLocked() else { return .noResolution }
 
-            guard let frame = camera.currentFrame, frame.id != lastProcessedFrameID else {
-                // 20ms keeps the liveness window's sample count high while staying close to the camera's native ~33ms cadence.
-                try? await Task.sleep(nanoseconds: 20_000_000)
+            // Waits on the capture queue's own hand-off — no polling, no fixed sleep between frames. The short timeout
+            // just bounds how long the deadline/overlay/lock checks above can go unchecked.
+            guard let frame = await frames.next(after: lastProcessedFrameID, timeout: .milliseconds(150)) else {
+                if !hasRestartedCamera, ContinuousClock.now - lastFrameAt > cameraStallTimeout {
+                    hasRestartedCamera = true
+                    lastFrameAt = .now
+                    camera.restart()
+                }
                 continue
             }
             lastProcessedFrameID = frame.id
+            lastFrameAt = .now
 
             let pipeline = self.pipeline
             let previousBoundingBox = lastFaceBoundingBox
@@ -367,7 +426,6 @@ final class FaceUnlockCoordinator {
             guard let (result, livenessFrame) = outcome else {
                 wrongFaceStartedAt = nil
                 lastFaceBoundingBox = nil
-                try? await Task.sleep(nanoseconds: 20_000_000)
                 continue
             }
             lastFaceBoundingBox = result.face.normalizedBoundingBox
@@ -415,8 +473,6 @@ final class FaceUnlockCoordinator {
                 await pocController.injectStoredPassword(requireAuthoritativeLock: true)
                 return .matched
             }
-
-            try? await Task.sleep(nanoseconds: 20_000_000)
         }
         return .noResolution
     }

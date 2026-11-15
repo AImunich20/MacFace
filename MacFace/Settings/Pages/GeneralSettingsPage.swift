@@ -142,6 +142,10 @@ struct GeneralSettingsPage: View {
                         MacFaceToggle(isOn: $settings.autoRetryOnce)
                     }
                     SettingsGroupDivider()
+                    SettingsRowContent(title: "Warm up camera on wake") {
+                        MacFaceToggle(isOn: $settings.prewarmCameraOnWake)
+                    }
+                    SettingsGroupDivider()
                     SettingsRowContent(title: "Haptic feedback") {
                         MacFaceToggle(isOn: $settings.hapticFeedbackEnabled)
                     }

@@ -114,6 +114,7 @@ final class MacFaceSettings {
         static let retryOnHover = "MacFaceSettings.retryOnHover"
         static let faceDetectionSeconds = "MacFaceSettings.faceDetectionSeconds"
         static let autoRetryOnce = "MacFaceSettings.autoRetryOnce"
+        static let prewarmCameraOnWake = "MacFaceSettings.prewarmCameraOnWake"
         static let hapticFeedbackEnabled = "MacFaceSettings.hapticFeedbackEnabled"
         static let showsInMenuBar = "MacFaceSettings.showsInMenuBar"
         static let preferredDisplayID = "MacFaceSettings.preferredDisplayID"
@@ -207,6 +208,12 @@ final class MacFaceSettings {
     }
     var autoRetryOnce: Bool {
         didSet { defaults.set(autoRetryOnce, forKey: Key.autoRetryOnce) }
+    }
+
+    /// Starts the camera when the lock screen wakes, if a hover or space press would be the trigger, so the scan
+    /// doesn't wait ~0.5s for the camera. Stops by itself after a few seconds if nothing happens.
+    var prewarmCameraOnWake: Bool {
+        didSet { defaults.set(prewarmCameraOnWake, forKey: Key.prewarmCameraOnWake) }
     }
     /// Trackpad haptic on hovering the notch/pill and on a successful unlock —
     /// see `NotchOverlayView`'s hover handler and `.onChange(of: controller.phase)`.
@@ -330,6 +337,7 @@ final class MacFaceSettings {
             .map { min(max($0, Self.faceDetectionRange.lowerBound), Self.faceDetectionRange.upperBound) }
             ?? 5
         autoRetryOnce = defaults.object(forKey: Key.autoRetryOnce) as? Bool ?? false
+        prewarmCameraOnWake = defaults.object(forKey: Key.prewarmCameraOnWake) as? Bool ?? true
         hapticFeedbackEnabled = defaults.object(forKey: Key.hapticFeedbackEnabled) as? Bool ?? true
         // Keep the icon available for existing and new installs unless the
         // user explicitly opts into the background-only mode.

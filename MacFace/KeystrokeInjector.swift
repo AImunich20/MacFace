@@ -113,8 +113,19 @@ enum KeystrokeInjector {
 
             while start < buffer.count {
                 var end = min(start + maximumUnicodeBatchLength, buffer.count)
+                // A batch never contains the same character twice in a row: the lock screen's secure field appears to drop
+                // the repeat within one event (glance #66: passwords with consecutive spaces failed). Repeats go in
+                // the next batch instead.
+                var index = start + 1
+                while index < end {
+                    if buffer[index] == buffer[index - 1] {
+                        end = index
+                        break
+                    }
+                    index += 1
+                }
                 // Do not split a high/low-surrogate pair across separate key events.
-                if end < buffer.count,
+                if end < buffer.count, end - start > 1,
                    (0xD800...0xDBFF).contains(buffer[end - 1]) {
                     end -= 1
                 }
