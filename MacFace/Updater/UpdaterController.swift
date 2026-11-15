@@ -16,7 +16,6 @@ import Sparkle
 final class UpdaterController {
     private let controller: SPUStandardUpdaterController
     private let presentationDelegate = UpdatePresentationDelegate()
-    private let feedDelegate = GitHubReleaseFeedDelegate()
 
     /// Mirrors `SPUUpdater.canCheckForUpdates` (KVO-only on Sparkle's side, hence the manual observation below).
     private(set) var canCheckForUpdates = false
@@ -37,7 +36,7 @@ final class UpdaterController {
         // matching how the rest of `AppEnvironment`'s controllers are wired.
         controller = SPUStandardUpdaterController(
             startingUpdater: false,
-            updaterDelegate: feedDelegate,
+            updaterDelegate: nil,
             userDriverDelegate: presentationDelegate
         )
 
@@ -63,43 +62,6 @@ final class UpdaterController {
     /// User-initiated "Check for Updates" — shows Sparkle's standard progress UI.
     func checkForUpdates() {
         controller.checkForUpdates(nil)
-    }
-
-    /// The branch whose `appcast.xml` is polled for updates (e.g. `petal-release`), shown on the About page.
-    var updateChannel: String { GitHubReleaseFeedDelegate.branch }
-}
-
-/// Points Sparkle at the `appcast.xml` committed on a dedicated GitHub branch (default `petal-release`) instead of a
-/// hosted website. The appcast's `<enclosure>` URLs point at assets attached to GitHub Releases, so publishing an update is
-/// "upload the signed DMG to a release, then commit the new appcast entry to the `petal-release` branch".
-///
-/// Configured through Info.plist:
-///   - `MFUpdateRepository` — `owner/repo` on GitHub (e.g. `AImunich20/MacFace`)
-///   - `MFUpdateBranch`     — branch holding `appcast.xml` (default `petal-release`)
-/// Falls back to `SUFeedURL` when the repository key is missing.
-private final class GitHubReleaseFeedDelegate: NSObject, SPUUpdaterDelegate {
-    nonisolated static let defaultBranch = "petal-release"
-
-    nonisolated static var repository: String? {
-        let value = Bundle.main.object(forInfoDictionaryKey: "MFUpdateRepository") as? String
-        guard let value, !value.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
-        return value
-    }
-
-    nonisolated static var branch: String {
-        let value = Bundle.main.object(forInfoDictionaryKey: "MFUpdateBranch") as? String
-        guard let value, !value.trimmingCharacters(in: .whitespaces).isEmpty else { return defaultBranch }
-        return value
-    }
-
-    nonisolated static var feedURLString: String? {
-        guard let repository else { return nil }
-        return "https://raw.githubusercontent.com/\(repository)/\(branch)/appcast.xml"
-    }
-
-    /// Returning `nil` lets Sparkle use `SUFeedURL` from Info.plist.
-    nonisolated func feedURLString(for updater: SPUUpdater) -> String? {
-        Self.feedURLString
     }
 }
 

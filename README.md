@@ -43,7 +43,7 @@ https://github.com/user-attachments/assets/77438826-80a9-4ab2-9fc3-42407a2d0adb
 - macOS 15 Sequoia or later
 - Apple Silicon or Intel Mac
 
-<a href="https://github.com/AImunich20/MacFace/releases/latest/download/MacFace.dmg" target="_self"><img width="200" src="https://github.com/user-attachments/assets/cdb8af97-1ee2-4669-b7cb-dcfb56c9dd61" alt="Download for Mac" /></a>
+<a href="https://github.com/AImunich20/MacFace-releases/releases/latest/download/MacFace.dmg" target="_self"><img width="200" src="https://github.com/user-attachments/assets/cdb8af97-1ee2-4669-b7cb-dcfb56c9dd61" alt="Download for Mac" /></a>
 
 Open the `.dmg` file and drag MacFace to `/Applications`, then open it.
 
@@ -168,12 +168,30 @@ Not currently accepting PRs. Feel free to fork this project.
 
 App feedback goes to [GitHub Issues](https://github.com/AImunich20/MacFace/issues).
 
-## Updates (`petal-release` channel)
+## Releasing updates
 
-MacFace checks for updates with [Sparkle](https://sparkle-project.org). The feed is the `appcast.xml` file on the
-[`petal-release`](https://github.com/AImunich20/MacFace/tree/petal-release) branch, and the DMGs it points to are assets
-on GitHub Releases. The repository and branch are set by `MFUpdateRepository` / `MFUpdateBranch` in `MacFace/Info.plist`.
-See [docs/RELEASING.md](docs/RELEASING.md) for how to publish an update.
+Like Petal, MacFace ships through a separate **public** repo,
+[`AImunich20/MacFace-releases`](https://github.com/AImunich20/MacFace-releases), which holds the download page and the
+GitHub Releases. Every installed copy checks
+`https://github.com/AImunich20/MacFace-releases/releases/latest/download/appcast.xml` (`SUFeedURL` in `MacFace/Info.plist`).
+
+Updates are signed with an EdDSA key stored in your Keychain under the account `macface`. Its public key goes in
+`SUPublicEDKey` in `MacFace/Info.plist`. Sparkle's tools are in `…/SourcePackages/artifacts/sparkle/Sparkle/bin` after Xcode resolves packages:
+
+```sh
+generate_keys --account macface                        # once: create the key, then paste the public key into Info.plist
+generate_keys --account macface -x macface-private-key # back it up (never commit it)
+```
+
+To ship a version: write `release-notes/<version>.md`, commit (the build number is the commit count), then
+
+```sh
+VERSION=1.3 scripts/release.sh             # build, sign, update appcast.xml
+VERSION=1.3 PUBLISH=1 scripts/release.sh   # …and create the GitHub release in MacFace-releases
+scripts/publish-site.sh                    # download page + README for the releases repo (GitHub Pages)
+```
+
+and commit the updated `appcast.xml`. Set `DEVELOPMENT_TEAM`, or `SIGN_IDENTITY` + `NOTARY_PROFILE` for Developer ID builds.
 
 ## Acknowledgements
 

@@ -42,10 +42,6 @@ struct AboutSettingsPage: View {
             Text(versionString)
                 .font(.system(size: 12))
                 .foregroundStyle(SettingsMetrics.textSecondary)
-
-            Text("Update channel: \(updater.updateChannel)")
-                .font(.system(size: 11))
-                .foregroundStyle(SettingsMetrics.textSecondary)
         }
         .frame(maxWidth: .infinity)
         .padding(.bottom, 16)
