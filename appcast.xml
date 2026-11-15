@@ -2,5 +2,23 @@
 <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
     <channel>
         <title>MacFace</title>
+        <item>
+            <title>MacFace 1.3</title>
+            <pubDate>Sun, 15 Nov 2026 14:53:10 +0700</pubDate>
+            <sparkle:version>140</sparkle:version>
+            <sparkle:shortVersionString>1.3</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
+            <description sparkle:format="markdown"><![CDATA[## MacFace 1.3
+
+First MacFace release, based on glance 1.2.
+
+- Renamed the app to MacFace (new bundle ID `com.aimunich20.macface`)
+- Updates now come from [MacFace-releases](https://github.com/AImunich20/MacFace-releases)
+- Recognition, liveness checks and unlocking work the same as glance 1.2
+
+If you used glance before, set MacFace up from scratch: enroll your face and grant Camera and Accessibility again.
+]]></description>
+            <enclosure url="https://github.com/AImunich20/MacFace-releases/releases/download/v1.3/MacFace-1.3.dmg" type="application/octet-stream" sparkle:edSignature="1PEFAZNtf2KrisRD1Zj0Uf5EUHUm+7WaoEdObBxuBUPbalHKWFMNmz6jxvl+JeY38RRw2wj6p/7PVvrRXL9NBw==" length="15994532"/>
+        </item>
     </channel>
 </rss>
