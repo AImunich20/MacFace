@@ -5,7 +5,7 @@
 	<key>SUFeedURL</key>
 	<string>https://github.com/AImunich20/MacFace-releases/releases/latest/download/appcast.xml</string>
 	<key>SUPublicEDKey</key>
-	<string>o9uQmlzKzh7NZvFtVktVh/wqw4Ie6WshX8K8NFDweWY=</string>
+	<string>Ak7zEw3h2iRWbmJF2oqnxEB4WQGXZ9nPMJEJVsbibu0=</string>
 	<key>SUAutomaticallyUpdate</key>
 	<false/>
 	<key>SUEnableInstallerLauncherService</key>
