@@ -21,7 +21,7 @@ DMG="build/MacFace-${VERSION}.dmg"
 
 XCODE_ARGS=(
     -project MacFace.xcodeproj -scheme MacFace -configuration Release
-    -derivedDataPath "$DERIVED" -destination "generic/platform=macOS"
+    -derivedDataPath "$DERIVED" -destination "generic/platform=macOS" -allowProvisioningUpdates
     MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
 )
 [[ -n "${DEVELOPMENT_TEAM:-}" ]] && XCODE_ARGS+=(DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM")
