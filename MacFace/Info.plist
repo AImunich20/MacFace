@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>MFUpdateRepository</key>
+	<string>AImunich20/MacFace</string>
+	<key>MFUpdateBranch</key>
+	<string>petal-release</string>
+	<key>SUFeedURL</key>
+	<string>https://raw.githubusercontent.com/AImunich20/MacFace/petal-release/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>o9uQmlzKzh7NZvFtVktVh/wqw4Ie6WshX8K8NFDweWY=</string>
+	<key>SUAutomaticallyUpdate</key>
+	<false/>
+	<key>SUEnableInstallerLauncherService</key>
+	<false/>
+</dict>
+</plist>
